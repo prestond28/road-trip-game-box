@@ -1,0 +1,520 @@
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  StyleSheet,
+  Text,
+  View,
+  Alert,
+  Vibration,
+} from 'react-native';
+import { PorcupineManager } from '@picovoice/porcupine-react-native';
+import Sound from 'react-native-sound';
+import { PORCUPINE_ACCESS_KEY } from '@env';
+import { ensureISpySeeded, getAllISpyItems } from '../src/iSpyDb';
+
+const VoiceRecog = () => {
+  const [isListening, setIsListening] = useState(false);
+  const [result, setResult] = useState('');
+  const [Voice, setVoice] = useState<any>(null);
+  const porcupineRef = useRef<PorcupineManager | null>(null);
+  const isCleaningUpRef = useRef(false);
+  const hasPlayedBeepRef = useRef(false);
+  const voiceSessionActiveRef = useRef(false);
+  const sessionTimeoutRef = useRef<any>(null);
+  const lastResultRef = useRef<string>('');
+  const [needsCleanup, setNeedsCleanup] = useState(false);
+  const sawSpeechEndRef = useRef(false);
+  const handlersRegisteredRef = useRef(false);
+  const cleanupRequestedRef = useRef(false);
+
+  const requestCleanup = () => {
+    if (!cleanupRequestedRef.current) {
+      cleanupRequestedRef.current = true;
+      // Immediately mark session inactive to halt UI updates
+      voiceSessionActiveRef.current = false;
+      setNeedsCleanup(true);
+    }
+  };
+
+  const startCleanup = () => {
+    if (isCleaningUpRef.current) {
+      console.log('Cleanup already in progress, skipping...');
+      return;
+    }
+    console.log('STARTING CLEANUP PROCESS...');
+    isCleaningUpRef.current = true;
+    voiceSessionActiveRef.current = false;
+    handlersRegisteredRef.current = false;
+  // keep cleanupRequestedRef true until teardown completes
+    
+    try {
+      setIsListening(false);
+    } catch (e) {
+      console.error('Error setting isListening to false during cleanup:', e);
+    }
+
+    if (sessionTimeoutRef.current) {
+      clearTimeout(sessionTimeoutRef.current);
+      sessionTimeoutRef.current = null;
+    }
+
+    // Immediately detach handlers to prevent re-entrancy during teardown
+    try {
+      if (Voice) {
+        Voice.onSpeechResults = undefined as any;
+        Voice.onSpeechPartialResults = undefined as any;
+        Voice.onSpeechError = undefined as any;
+        Voice.onSpeechStart = undefined as any;
+        Voice.onSpeechEnd = undefined as any;
+        if (typeof Voice.removeAllListeners === 'function') {
+          Voice.removeAllListeners();
+        }
+      }
+    } catch (e) {
+      console.log('Detaching handlers threw, continuing...');
+    }
+
+    // Strategy:
+    // - If we already received onSpeechEnd, avoid calling stop/destroy (these can crash after end)
+    // - Else, use cancel/destroy with spacing.
+    if (sawSpeechEndRef.current) {
+      console.log('Speech already ended; skipping Voice.stop/destroy to avoid native crash.');
+      sawSpeechEndRef.current = false; // reset for next session
+      // Try a safe cancel to hint the service to release mic (should be no-op post-end)
+      setTimeout(() => {
+        try { if (Voice?.cancel) Voice.cancel().catch(() => {}); } catch {}
+      }, 100);
+      // Longer delay before restarting Porcupine to avoid mic contention
+      setTimeout(() => {
+        console.log('Restarting Porcupine after safe delay (post-end)...');
+        if (porcupineRef.current) {
+          porcupineRef.current
+            .start()
+            .then(() => {
+              console.log('Porcupine restarted successfully.');
+              isCleaningUpRef.current = false;
+              cleanupRequestedRef.current = false;
+            })
+            .catch((error: any) => {
+              console.error('Error restarting Porcupine:', error);
+              isCleaningUpRef.current = false;
+              cleanupRequestedRef.current = false;
+            });
+        } else {
+          isCleaningUpRef.current = false;
+          cleanupRequestedRef.current = false;
+        }
+      }, 2000);
+      return;
+    }
+
+    // If we didn't get onSpeechEnd, cancel/destroy with spacing
+    setTimeout(() => {
+      console.log('Teardown path: Step 1 - cancel');
+      try { if (Voice?.cancel) Voice.cancel().catch(() => {}); } catch {}
+      setTimeout(() => {
+        console.log('Teardown path: Step 2 - destroy');
+        try { if (Voice?.destroy) Voice.destroy().catch(() => {}); } catch {}
+        setTimeout(() => {
+          console.log('Teardown path: Step 3 - restart Porcupine');
+          if (porcupineRef.current) {
+            porcupineRef.current
+              .start()
+              .then(() => {
+                console.log('Porcupine restarted successfully.');
+                isCleaningUpRef.current = false;
+                cleanupRequestedRef.current = false;
+              })
+              .catch((error: any) => {
+                console.error('Error restarting Porcupine:', error);
+                isCleaningUpRef.current = false;
+                cleanupRequestedRef.current = false;
+              });
+          } else {
+            isCleaningUpRef.current = false;
+            cleanupRequestedRef.current = false;
+          }
+        }, 1200);
+      }, 800);
+    }, 400);
+  };
+
+  // Run cleanup outside of Voice callbacks to avoid native race conditions
+  useEffect(() => {
+    if (needsCleanup) {
+      console.log('Cleanup requested via state trigger. Running startCleanup()...');
+      // Let any current event callback unwind before tearing down native modules
+      setTimeout(() => startCleanup(), 0);
+      setNeedsCleanup(false);
+    }
+  }, [needsCleanup]);
+
+  // Audio feedback function using custom beep.mp3
+  const playBeep = () => {
+    try {
+      // Vibrate with a distinctive pattern for tactile feedback
+      Vibration.vibrate([100, 50, 100]);
+      
+      // Set audio category for playback
+      Sound.setCategory('Playback', true); // Allow mixing with other sounds
+      
+      // Load and play the custom beep.mp3 from res/raw folder
+      const beepSound = new Sound('beep.mp3', Sound.MAIN_BUNDLE, (error) => {
+        if (error) {
+          console.log('Failed to load beep.mp3 from res/raw folder:', error);
+          // Fallback to system sound if custom beep fails
+          const fallbackSound = new Sound('/system/media/audio/ui/camera_click.ogg', '', (error) => {
+            if (error) {
+              console.log('Fallback system sound also failed, using vibration only');
+            } else {
+              fallbackSound.setVolume(0.7);
+              fallbackSound.play((success) => {
+                console.log(success ? 'Fallback sound played' : 'Fallback sound failed');
+                fallbackSound.release();
+              });
+            }
+          });
+        } else {
+          beepSound.setVolume(0.8);
+          beepSound.play((success) => {
+            if (success) {
+              console.log('Custom beep.mp3 played successfully');
+            } else {
+              console.log('Custom beep.mp3 playback failed');
+            }
+            beepSound.release();
+          });
+        }
+      });
+      
+      console.log('Wake word detected - playing custom beep and vibration...');
+      
+    } catch (error) {
+      console.error('Error with audio feedback:', error);
+      // Fallback to just vibration
+      Vibration.vibrate([100, 50, 100]);
+    }
+  };
+
+  useEffect(() => {
+    const loadVoice = async () => {
+      try {
+        const { default: Voice } = await import('@react-native-voice/voice');
+        console.log('Voice module loaded:', Voice);
+        
+        setVoice(Voice);
+        
+      } catch (error) {
+        console.error('Failed to load Voice module:', error);
+        Alert.alert('Error', 'Failed to load voice recognition module');
+      }
+    };
+
+    loadVoice();
+  }, []);
+
+  // Only initialize Porcupine after Voice is loaded
+  useEffect(() => {
+    if (!Voice) return;
+    const initPorcupine = async () => {
+      if (!PORCUPINE_ACCESS_KEY) {
+        Alert.alert('Porcupine error', 'Access key is missing.');
+        return;
+      }
+      try {
+        // Use your custom wake word
+        porcupineRef.current = await PorcupineManager.fromKeywordPaths(
+          PORCUPINE_ACCESS_KEY,
+          ['Hey-Game-Box_en_android_v3_0_0.ppn'],
+          async (keywordIndex) => {
+            console.log('Wake word "Hey Game Box" detected! Starting listening...');
+            // Reset flags for new listening session
+            hasPlayedBeepRef.current = false;
+            voiceSessionActiveRef.current = false;
+            lastResultRef.current = '';
+            if (Voice && typeof Voice.start === 'function') {
+              try {
+                // Check if we're already listening and skip if so
+                if (isListening) {
+                  console.log('Already listening, ignoring wake word');
+                  return;
+                }
+                
+                // Stop Porcupine to free up the microphone
+                console.log('Stopping Porcupine to free microphone...');
+                if (porcupineRef.current) {
+                  await porcupineRef.current.stop();
+                }
+                
+                // More thorough cleanup of Voice recognition
+                console.log('Cleaning up any existing voice recognition...');
+                try {
+                  await Voice.cancel();
+                  await Voice.stop();
+                  await Voice.destroy();
+                  await Voice.removeAllListeners();
+                } catch (stopError) {
+                  console.log('Voice cleanup completed (some calls expected to fail)');
+                }
+                
+                // Longer wait to ensure complete cleanup
+                await new Promise<void>(resolve => setTimeout(() => resolve(), 2000));
+                
+                console.log('Setting up voice recognition callbacks...');
+                if (handlersRegisteredRef.current) {
+                  console.log('Handlers already registered; skipping re-registration');
+                }
+                Voice.onSpeechResults = (e: any) => {
+                  console.log('Final speech result (onSpeechResults):', e.value);
+                  if (cleanupRequestedRef.current || isCleaningUpRef.current || !voiceSessionActiveRef.current) return;
+                  
+                  requestCleanup();
+                };
+                Voice.onSpeechPartialResults = (e: any) => {
+                  if (cleanupRequestedRef.current || isCleaningUpRef.current || !voiceSessionActiveRef.current) return;
+                  
+                  console.log('Partial speech result:', e.value);
+                  
+                  try {
+                    if (e.value && e.value.length > 0) {
+                      const text = String(e.value[0]).trim();
+                      if (text.length > 0 && text !== lastResultRef.current) {
+                        lastResultRef.current = text;
+                        setResult(text);
+                      }
+                      
+                      // Heuristic: If the partial result has multiple options, it's likely the final one.
+                      if (e.value.length > 1) {
+                        console.log('Partial result looks final, initiating cleanup.');
+                        requestCleanup();
+                      }
+                    }
+                  } catch (error) {
+                    console.error('Error processing partial result:', error);
+                  }
+                };
+                Voice.onSpeechError = (e: any) => {
+                  // If we're already cleaning up or cleanup is requested, ignore errors
+                  if (cleanupRequestedRef.current || isCleaningUpRef.current) {
+                    return;
+                  }
+                  const code = e?.error?.code;
+                  const message = e?.error?.message || '';
+                  // Android often emits code '5' (Client side error) after a successful session
+                  if (code === '5' || message.includes('Client side error')) {
+                    console.log('Ignoring benign client-side error (code 5) after session.');
+                    return;
+                  }
+                  console.warn('Speech recognition error (handling):', e);
+                  requestCleanup();
+                };
+                Voice.onSpeechStart = () => {
+                  console.log('Speech recognition started - you can speak now!');
+                  
+                  // If session is already active, this is a duplicate start - ignore it
+                  if (voiceSessionActiveRef.current) {
+                    console.log('Voice session already active, ignoring duplicate start');
+                    return;
+                  }
+                  
+                  voiceSessionActiveRef.current = true;
+                  setIsListening(true);
+                  
+                  // Set a safety timeout to force session end if callbacks get stuck
+                  if (sessionTimeoutRef.current) {
+                    clearTimeout(sessionTimeoutRef.current);
+                  }
+                  sessionTimeoutRef.current = setTimeout(() => {
+                    console.log('Safety timeout: Force ending voice session');
+                    requestCleanup();
+                  }, 15000); // 15 second safety timeout
+                  
+                  // Play beep sound only once per listening session
+                  if (!hasPlayedBeepRef.current) {
+                    hasPlayedBeepRef.current = true;
+                    playBeep();
+                  } else {
+                    console.log('Beep already played for this session, skipping...');
+                  }
+                };
+                Voice.onSpeechEnd = () => {
+                  console.log('Speech recognition ended. Waiting for final result...');
+                  sawSpeechEndRef.current = true;
+                  // The new logic in onSpeechPartialResults will handle the cleanup.
+                  // We can add a fallback timeout here if needed, but let's try without it first.
+                };
+                handlersRegisteredRef.current = true;
+                
+                console.log('Starting voice recognition with extended timeouts...');
+                await Voice.start('en-US', {
+                  EXTRA_PARTIAL_RESULTS: true,
+                  REQUEST_PERMISSIONS_AUTO: true,
+                  EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS: 8000,  // Wait 8 seconds of silence before stopping
+                  EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS: 6000,  // Wait 6 seconds for "possibly complete"  
+                  EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS: 12000,  // Minimum 12 seconds of listening
+                  EXTRA_MAX_RESULTS: 10,  // Allow more recognition attempts
+                });
+                console.log('Voice recognition started with timeouts: complete=8s, possibly=6s, minimum=12s');
+              } catch (error) {
+                console.error('Failed to start voice recognition:', error);
+                Alert.alert('Error', `Failed to start voice recognition: ${error}`);
+              }
+            } else {
+              Alert.alert('Voice error', 'Voice.start method not found.');
+            }
+          }
+        );
+        if (porcupineRef.current) {
+          await porcupineRef.current.start();
+        } else {
+          Alert.alert('Porcupine error', 'PorcupineManager failed to initialize.');
+        }
+      } catch (err) {
+        Alert.alert('Porcupine error', err instanceof Error ? err.message : String(err));
+        console.error('Porcupine error details:', err);
+      }
+    };
+    initPorcupine();
+    return () => {
+      if (porcupineRef.current) {
+        porcupineRef.current.stop();
+        porcupineRef.current.delete();
+      }
+    };
+  }, [Voice]);
+
+  // Test basic voice recognition without Porcupine
+  const startVoiceRecognition = async () => {
+    if (Voice && typeof Voice.start === 'function') {
+      try {
+        Voice.onSpeechResults = (e: any) => {
+          setResult(e.value?.[0] || '');
+          setIsListening(false);
+        };
+        Voice.onSpeechPartialResults = (e: any) => {
+          setResult(e.value?.[0] || '');
+        };
+        Voice.onSpeechError = (e: any) => {
+          setIsListening(false);
+          Alert.alert('Error', 'Speech recognition failed');
+        };
+        Voice.onSpeechStart = () => setIsListening(true);
+        Voice.onSpeechEnd = () => setIsListening(false);
+        await Voice.start('en-US');
+      } catch (error) {
+        Alert.alert('Error', 'Failed to start voice recognition: ' + error);
+      }
+    } else {
+      Alert.alert('Voice error', 'Voice.start method not found.');
+    }
+  };
+
+  const stopVoiceRecognition = async () => {
+    try {
+      if (Voice && typeof Voice.stop === 'function') {
+        await Voice.stop();
+      }
+      setIsListening(false);
+    } catch (error) {
+      console.error('Error stopping voice recognition:', error);
+    }
+  };
+
+
+ return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Voice Test</Text>
+      {result ? (
+        <View style={styles.resultContainer}>
+          <Text style={styles.resultText}>Result: {result}</Text>
+        </View>
+      ) : null}
+      <Text style={styles.status}>
+        Voice Module: {Voice ? 'Loaded' : 'Not Loaded'}
+      </Text>
+      <View style={[styles.button, styles.buttonIdle]}>
+        <Text
+          style={styles.buttonText}
+          onPress={async () => {
+            try {
+              const db = await ensureISpySeeded();
+              const items = await getAllISpyItems(db);
+              console.log(`All iSpy items (${items.length}):`, items);
+            } catch (error) {
+              console.error('Error ensuring iSpy database:', error);
+            }
+          }}
+        >
+          Console Log All iSpy Items
+        </Text>
+      </View>
+      
+      <View style={styles.statusContainer}>
+        {isListening ? (
+          <Text style={[styles.status, styles.listening]}>
+            🎤 Listening... Speak now!
+          </Text>
+        ) : (
+          <Text style={styles.status}>
+            Say "Hey Game Box" to start listening...
+          </Text>
+        )}
+      </View>
+    </View>
+  );
+};
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  title: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    marginBottom: 30,
+  },
+  resultContainer: {
+    padding: 15,
+    backgroundColor: '#f0f0f0',
+    borderRadius: 5,
+    marginBottom: 20,
+  },
+  resultText: {
+    fontSize: 16,
+  },
+  status: {
+    fontSize: 14,
+    color: '#666',
+  },
+  statusContainer: {
+    marginVertical: 10,
+    alignItems: 'center',
+  },
+  listening: {
+    color: '#007AFF',
+    fontWeight: 'bold',
+    fontSize: 16,
+  },
+  button: {
+    padding: 15,
+    borderRadius: 8,
+    marginVertical: 10,
+    minWidth: 150,
+    alignItems: 'center',
+  },
+  buttonIdle: {
+    backgroundColor: '#007AFF',
+  },
+  buttonListening: {
+    backgroundColor: '#FF3B30',
+  },
+  buttonText: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+});
+
+export default VoiceRecog;
