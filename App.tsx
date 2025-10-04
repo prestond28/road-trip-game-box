@@ -1,8 +1,3 @@
-/**
- * Voice Recognition Demo
- * React Native Voice Recognition App
- */
-
 import React from 'react';
 import {
   StatusBar,
@@ -12,7 +7,7 @@ import {
   SafeAreaProvider,
   SafeAreaView,
 } from 'react-native-safe-area-context';
-import VoiceTest from './VoiceTest';
+import VoiceRecog from './components/VoiceRecog';
 
 function App() {
   const isDarkMode = useColorScheme() === 'dark';
@@ -21,7 +16,7 @@ function App() {
     <SafeAreaProvider>
       <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
       <SafeAreaView style={{flex: 1}}>
-        <VoiceTest />
+        <VoiceRecog />
       </SafeAreaView>
     </SafeAreaProvider>
   );
