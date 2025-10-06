@@ -8,6 +8,8 @@ import {
   SafeAreaView,
 } from 'react-native-safe-area-context';
 import VoiceRecog from './components/VoiceRecog';
+import TextToSpeech from './components/TextToSpeech';
+import ISpyGame from './components/ISpyGame';
 
 function App() {
   const isDarkMode = useColorScheme() === 'dark';
@@ -17,6 +19,8 @@ function App() {
       <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
       <SafeAreaView style={{flex: 1}}>
         <VoiceRecog />
+        <ISpyGame />
+        <TextToSpeech />
       </SafeAreaView>
     </SafeAreaProvider>
   );

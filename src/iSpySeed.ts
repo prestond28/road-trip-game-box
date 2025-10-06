@@ -1,10 +1,15 @@
 export const iSpyItems: string[] = [
   "an orange construction cone",
   "a yellow car",
+  "a green car",
   "a cowboy hat",
   "an animal",
   "a license plate from another state",
   "a car being towed",
   "a star",
-  "a flag"
+  "a flag",
+  "a motorcycle",
+  "a Fedex truck",
+  "a person outside of a vehicle",
+  "a solar panel",
 ];

@@ -1,17 +1,25 @@
 import React, { useState, useEffect, useRef } from 'react';
-import {
-  StyleSheet,
-  Text,
-  View,
-  Alert,
-  Vibration,
-} from 'react-native';
+import { StyleSheet, Text, View, Alert, Vibration } from 'react-native';
 import { PorcupineManager } from '@picovoice/porcupine-react-native';
 import Sound from 'react-native-sound';
 import { PORCUPINE_ACCESS_KEY } from '@env';
-import { ensureISpySeeded, getAllISpyItems } from '../src/iSpyDb';
+import { voiceBus } from '../src/voiceBus';
 
-const VoiceRecog = () => {
+type VoiceRecogProps = {
+  onResult?: (finalText: string) => void;
+  onWake?: () => void;
+  onListeningChange?: (listening: boolean) => void;
+  language?: string; // e.g., 'en-US'
+  enableBeep?: boolean; // play beep on speech start
+};
+
+const VoiceRecog: React.FC<VoiceRecogProps> = ({
+  onResult,
+  onWake,
+  onListeningChange,
+  language = 'en-US',
+  enableBeep = true,
+}) => {
   const [isListening, setIsListening] = useState(false);
   const [result, setResult] = useState('');
   const [Voice, setVoice] = useState<any>(null);
@@ -21,6 +29,7 @@ const VoiceRecog = () => {
   const voiceSessionActiveRef = useRef(false);
   const sessionTimeoutRef = useRef<any>(null);
   const lastResultRef = useRef<string>('');
+  const emittedThisSessionRef = useRef(false);
   const [needsCleanup, setNeedsCleanup] = useState(false);
   const sawSpeechEndRef = useRef(false);
   const handlersRegisteredRef = useRef(false);
@@ -48,6 +57,8 @@ const VoiceRecog = () => {
     
     try {
       setIsListening(false);
+      onListeningChange?.(false);
+      voiceBus.emitListening(false);
     } catch (e) {
       console.error('Error setting isListening to false during cleanup:', e);
     }
@@ -227,10 +238,13 @@ const VoiceRecog = () => {
           ['Hey-Game-Box_en_android_v3_0_0.ppn'],
           async (keywordIndex) => {
             console.log('Wake word "Hey Game Box" detected! Starting listening...');
+            onWake?.();
+            voiceBus.emitWake();
             // Reset flags for new listening session
             hasPlayedBeepRef.current = false;
             voiceSessionActiveRef.current = false;
             lastResultRef.current = '';
+            emittedThisSessionRef.current = false;
             if (Voice && typeof Voice.start === 'function') {
               try {
                 // Check if we're already listening and skip if so
@@ -260,46 +274,70 @@ const VoiceRecog = () => {
                 await new Promise<void>(resolve => setTimeout(() => resolve(), 2000));
                 
                 console.log('Setting up voice recognition callbacks...');
-                if (handlersRegisteredRef.current) {
-                  console.log('Handlers already registered; skipping re-registration');
-                }
+
+                // Results (final)
                 Voice.onSpeechResults = (e: any) => {
-                  console.log('Final speech result (onSpeechResults):', e.value);
                   if (cleanupRequestedRef.current || isCleaningUpRef.current || !voiceSessionActiveRef.current) return;
-                  
+                  const values: string[] = Array.isArray(e.value) ? e.value : [];
+                  console.log('Final speech result (onSpeechResults):', values);
+                  try {
+                    const text = String(values[0] ?? '').trim();
+                    if (text && !emittedThisSessionRef.current) {
+                      emittedThisSessionRef.current = true;
+                      lastResultRef.current = text;
+                      setResult(text);
+                      try { onResult?.(text); } catch {}
+                      try { voiceBus.emitResult(text); } catch {}
+                    }
+                  } catch (err) {
+                    console.error('Error processing final result:', err);
+                  }
                   requestCleanup();
                 };
+
+                // Partials (early detection)
                 Voice.onSpeechPartialResults = (e: any) => {
                   if (cleanupRequestedRef.current || isCleaningUpRef.current || !voiceSessionActiveRef.current) return;
-                  
-                  console.log('Partial speech result:', e.value);
-                  
+                  const alts: string[] = Array.isArray(e.value) ? e.value : [];
+                  console.log('Partial speech result:', alts);
                   try {
-                    if (e.value && e.value.length > 0) {
-                      const text = String(e.value[0]).trim();
-                      if (text.length > 0 && text !== lastResultRef.current) {
-                        lastResultRef.current = text;
-                        setResult(text);
+                    if (alts.length > 0) {
+                      const primary = String(alts[0] ?? '').trim();
+                      if (primary && primary !== lastResultRef.current) {
+                        lastResultRef.current = primary;
+                        setResult(primary);
                       }
-                      
-                      // Heuristic: If the partial result has multiple options, it's likely the final one.
-                      if (e.value.length > 1) {
+                      // Early intent: robust match for "i spy" across variants
+                      const hasISpy = alts.some((v) =>
+                        String(v).toLowerCase().replace(/[^a-z]/g, '').includes('ispy')
+                      );
+                      if (hasISpy && !emittedThisSessionRef.current) {
+                        emittedThisSessionRef.current = true;
+                        const emitText = primary || String(alts.find(Boolean) || '').trim();
+                        try { onResult?.(emitText); } catch {}
+                        try { voiceBus.emitResult(emitText); } catch {}
+                      }
+                      // Heuristic: multiple alternatives likely means the recognizer is done
+                      if (alts.length > 1) {
                         console.log('Partial result looks final, initiating cleanup.');
+                        if (lastResultRef.current && !emittedThisSessionRef.current) {
+                          emittedThisSessionRef.current = true;
+                          try { onResult?.(lastResultRef.current); } catch {}
+                          try { voiceBus.emitResult(lastResultRef.current); } catch {}
+                        }
                         requestCleanup();
                       }
                     }
-                  } catch (error) {
-                    console.error('Error processing partial result:', error);
+                  } catch (err) {
+                    console.error('Error processing partial result:', err);
                   }
                 };
+
+                // Errors
                 Voice.onSpeechError = (e: any) => {
-                  // If we're already cleaning up or cleanup is requested, ignore errors
-                  if (cleanupRequestedRef.current || isCleaningUpRef.current) {
-                    return;
-                  }
+                  if (cleanupRequestedRef.current || isCleaningUpRef.current) return;
                   const code = e?.error?.code;
                   const message = e?.error?.message || '';
-                  // Android often emits code '5' (Client side error) after a successful session
                   if (code === '5' || message.includes('Client side error')) {
                     console.log('Ignoring benign client-side error (code 5) after session.');
                     return;
@@ -307,51 +345,47 @@ const VoiceRecog = () => {
                   console.warn('Speech recognition error (handling):', e);
                   requestCleanup();
                 };
+
+                // Start
                 Voice.onSpeechStart = () => {
                   console.log('Speech recognition started - you can speak now!');
-                  
-                  // If session is already active, this is a duplicate start - ignore it
                   if (voiceSessionActiveRef.current) {
                     console.log('Voice session already active, ignoring duplicate start');
                     return;
                   }
-                  
                   voiceSessionActiveRef.current = true;
                   setIsListening(true);
-                  
-                  // Set a safety timeout to force session end if callbacks get stuck
+                  onListeningChange?.(true);
+                  voiceBus.emitListening(true);
                   if (sessionTimeoutRef.current) {
                     clearTimeout(sessionTimeoutRef.current);
                   }
                   sessionTimeoutRef.current = setTimeout(() => {
                     console.log('Safety timeout: Force ending voice session');
                     requestCleanup();
-                  }, 15000); // 15 second safety timeout
-                  
-                  // Play beep sound only once per listening session
-                  if (!hasPlayedBeepRef.current) {
+                  }, 15000);
+                  if (enableBeep && !hasPlayedBeepRef.current) {
                     hasPlayedBeepRef.current = true;
                     playBeep();
-                  } else {
-                    console.log('Beep already played for this session, skipping...');
                   }
                 };
+
+                // End
                 Voice.onSpeechEnd = () => {
                   console.log('Speech recognition ended. Waiting for final result...');
                   sawSpeechEndRef.current = true;
-                  // The new logic in onSpeechPartialResults will handle the cleanup.
-                  // We can add a fallback timeout here if needed, but let's try without it first.
                 };
+
                 handlersRegisteredRef.current = true;
-                
+
                 console.log('Starting voice recognition with extended timeouts...');
-                await Voice.start('en-US', {
+                await Voice.start(language, {
                   EXTRA_PARTIAL_RESULTS: true,
                   REQUEST_PERMISSIONS_AUTO: true,
-                  EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS: 8000,  // Wait 8 seconds of silence before stopping
-                  EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS: 6000,  // Wait 6 seconds for "possibly complete"  
-                  EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS: 12000,  // Minimum 12 seconds of listening
-                  EXTRA_MAX_RESULTS: 10,  // Allow more recognition attempts
+                  EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS: 8000,
+                  EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS: 6000,
+                  EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS: 12000,
+                  EXTRA_MAX_RESULTS: 10,
                 });
                 console.log('Voice recognition started with timeouts: complete=8s, possibly=6s, minimum=12s');
               } catch (error) {
@@ -382,7 +416,7 @@ const VoiceRecog = () => {
     };
   }, [Voice]);
 
-  // Test basic voice recognition without Porcupine
+  // Optional helper for manual start without Porcupine
   const startVoiceRecognition = async () => {
     if (Voice && typeof Voice.start === 'function') {
       try {
@@ -427,27 +461,7 @@ const VoiceRecog = () => {
         <View style={styles.resultContainer}>
           <Text style={styles.resultText}>Result: {result}</Text>
         </View>
-      ) : null}
-      <Text style={styles.status}>
-        Voice Module: {Voice ? 'Loaded' : 'Not Loaded'}
-      </Text>
-      <View style={[styles.button, styles.buttonIdle]}>
-        <Text
-          style={styles.buttonText}
-          onPress={async () => {
-            try {
-              const db = await ensureISpySeeded();
-              const items = await getAllISpyItems(db);
-              console.log(`All iSpy items (${items.length}):`, items);
-            } catch (error) {
-              console.error('Error ensuring iSpy database:', error);
-            }
-          }}
-        >
-          Console Log All iSpy Items
-        </Text>
-      </View>
-      
+      ) : null}      
       <View style={styles.statusContainer}>
         {isListening ? (
           <Text style={[styles.status, styles.listening]}>
