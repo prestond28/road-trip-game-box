@@ -4,7 +4,9 @@ import { ensureISpySeeded, getRandomISpyItem, deleteTable } from '../src/iSpyDb'
 import { speakText } from './TextToSpeech';
 import { voiceBus } from '../src/voiceBus';
 
-const ISpyGame: React.FC = () => {
+type Props = { headless?: boolean };
+
+const ISpyGame: React.FC<Props> = ({ headless = false }) => {
   const dbRef = useRef<any>(null);
   const [lastHeard, setLastHeard] = useState('');
   const [lastISpy, setLastISpy] = useState<string | null>(null);
@@ -57,6 +59,8 @@ const ISpyGame: React.FC = () => {
     }
   };
 
+  if (headless) return null;
+
   return (
     <View style={styles.container}>
       <Text style={styles.title}>I Spy (Voice)</Text>
@@ -72,7 +76,6 @@ const ISpyGame: React.FC = () => {
       {lastISpy ? (
         <View style={styles.card}><Text style={styles.label}>I Spy item:</Text><Text style={styles.value}>{lastISpy}</Text></View>
       ) : null}
-    
     </View>
   );
 };
