@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
+import { View, Text, StyleSheet } from 'react-native';
 import Tts from 'react-native-tts';
 
 // Module-scoped one-time TTS init
@@ -8,34 +8,48 @@ async function ensureTtsInit() {
 	if (ttsInitialized) return;
 	try { await Tts.getInitStatus(); } catch {}
 	try { await Tts.setDefaultLanguage('en-US'); } catch {}
-	Tts.setDefaultRate(0.85, true);
+	Tts.setDefaultRate(1, true);
 	Tts.setDefaultPitch(1.0);
 	ttsInitialized = true;
 }
 
 // Reusable function to speak any text
-export async function speakText(text: string) {
+export async function speakText(text: string): Promise<void> {
 	await ensureTtsInit();
 	await Tts.stop();
-	Tts.speak(text);
+	return new Promise((resolve) => {
+		let done = false;
+		const finish = () => {
+			if (done) return; done = true;
+			if (subStart?.remove) subStart.remove(); else Tts.removeEventListener?.('tts-start', onStart);
+			if (subFinish?.remove) subFinish.remove(); else Tts.removeEventListener?.('tts-finish', onFinish);
+			if (subCancel?.remove) subCancel.remove(); else Tts.removeEventListener?.('tts-cancel', onCancel);
+			resolve();
+		};
+		const onStart = () => {};
+		const onFinish = () => finish();
+		const onCancel = () => finish();
+		const subStart = Tts.addEventListener('tts-start', onStart) as { remove?: () => void } | void;
+		const subFinish = Tts.addEventListener('tts-finish', onFinish) as { remove?: () => void } | void;
+		const subCancel = Tts.addEventListener('tts-cancel', onCancel) as { remove?: () => void } | void;
+		Tts.speak(text);
+		setTimeout(() => finish(), 30000);
+	});
 }
 
-const TextToSpeech = () => {
+type Props = { headless?: boolean };
+
+const TextToSpeech: React.FC<Props> = ({ headless = false }) => {
 	useEffect(() => {
 		ensureTtsInit();
 		return () => { Tts.stop(); };
 	}, []);
 
-	const onStartGame = async () => {
-		await speakText('Hello there, Finn!');
-	};
+	if (headless) return null;
 
 	return (
 		<View style={styles.container}>
 			<Text style={styles.title}>Text to Speech Demo</Text>
-			<TouchableOpacity style={styles.button} onPress={onStartGame}>
-				<Text style={styles.buttonText}>Start Game</Text>
-			</TouchableOpacity>
 		</View>
 	);
 };

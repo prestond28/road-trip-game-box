@@ -4,6 +4,7 @@ import { PorcupineManager } from '@picovoice/porcupine-react-native';
 import Sound from 'react-native-sound';
 import { PORCUPINE_ACCESS_KEY } from '@env';
 import { voiceBus } from '../src/voiceBus';
+import Tts from 'react-native-tts';
 
 type VoiceRecogProps = {
   onResult?: (finalText: string) => void;
@@ -22,6 +23,7 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
 }) => {
   const [isListening, setIsListening] = useState(false);
   const [result, setResult] = useState('');
+  const [isSpeaking, setIsSpeaking] = useState(false);
   const [Voice, setVoice] = useState<any>(null);
   const porcupineRef = useRef<PorcupineManager | null>(null);
   const isCleaningUpRef = useRef(false);
@@ -34,6 +36,7 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
   const sawSpeechEndRef = useRef(false);
   const handlersRegisteredRef = useRef(false);
   const cleanupRequestedRef = useRef(false);
+  const ttsClearTimerRef = useRef<any>(null);
 
   const requestCleanup = () => {
     if (!cleanupRequestedRef.current) {
@@ -164,17 +167,15 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
     try {
       // Vibrate with a distinctive pattern for tactile feedback
       Vibration.vibrate([100, 50, 100]);
-      
       // Set audio category for playback
       Sound.setCategory('Playback', true); // Allow mixing with other sounds
-      
-      // Load and play the custom beep.mp3 from res/raw folder
+      // Load and play the custom beep.mp3 from bundle (Android raw)
       const beepSound = new Sound('beep.mp3', Sound.MAIN_BUNDLE, (error) => {
         if (error) {
-          console.log('Failed to load beep.mp3 from res/raw folder:', error);
+          console.log('Failed to load beep.mp3 from bundle:', error);
           // Fallback to system sound if custom beep fails
-          const fallbackSound = new Sound('/system/media/audio/ui/camera_click.ogg', '', (error) => {
-            if (error) {
+          const fallbackSound = new Sound('/system/media/audio/ui/camera_click.ogg', '', (fallbackErr) => {
+            if (fallbackErr) {
               console.log('Fallback system sound also failed, using vibration only');
             } else {
               fallbackSound.setVolume(0.7);
@@ -196,14 +197,76 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
           });
         }
       });
-      
-      console.log('Wake word detected - playing custom beep and vibration...');
-      
     } catch (error) {
       console.error('Error with audio feedback:', error);
       // Fallback to just vibration
       Vibration.vibrate([100, 50, 100]);
     }
+  };
+
+  // Track TTS speaking state to hide status while TTS is active
+  useEffect(() => {
+    const onStart = () => {
+      setIsSpeaking(true);
+      // Always clear the quoted result with a small delay
+      try { if (ttsClearTimerRef.current) { clearTimeout(ttsClearTimerRef.current); ttsClearTimerRef.current = null; } } catch {}
+      const last = (lastResultRef.current || result || '').toString();
+      const delay = last.trim().length > 0 ? 1200 : 0;
+      if (delay > 0) {
+        ttsClearTimerRef.current = setTimeout(() => {
+          setResult('');
+          try { lastResultRef.current = ''; } catch {}
+          ttsClearTimerRef.current = null;
+        }, delay);
+      } else {
+        setResult('');
+        try { lastResultRef.current = ''; } catch {}
+      }
+    };
+    const onEnd = () => setIsSpeaking(false);
+    Tts.addEventListener('tts-start', onStart);
+    Tts.addEventListener('tts-finish', onEnd);
+    Tts.addEventListener('tts-cancel', onEnd);
+    return () => {
+      try { if (ttsClearTimerRef.current) { clearTimeout(ttsClearTimerRef.current); ttsClearTimerRef.current = null; } } catch {}
+      try { (Tts as any).removeEventListener('tts-start', onStart); } catch {}
+      try { (Tts as any).removeEventListener('tts-finish', onEnd); } catch {}
+      try { (Tts as any).removeEventListener('tts-cancel', onEnd); } catch {}
+    };
+  }, [isListening, result]);
+
+  // Partial results handler, performs early detection
+  const handlePartialResults = (e: any) => {
+    if (cleanupRequestedRef.current || isCleaningUpRef.current || !voiceSessionActiveRef.current) return;
+    const alts: string[] = Array.isArray(e?.value) ? e.value : [];
+    if (alts.length === 0) return;
+    const primary = String(alts[0] ?? '').trim();
+    if (primary && primary !== lastResultRef.current) {
+      lastResultRef.current = primary;
+      setResult(primary);
+    }
+    try {
+      // Early yes/no detection when awaiting an answer
+      if (typeof voiceBus.isAwaitingAnswer === 'function' && voiceBus.isAwaitingAnswer()) {
+        const matchYN = alts.some((v) => /\b(yes|yeah|yep|yup|no|nope|nah)\b/i.test(String(v)));
+        if (matchYN && !emittedThisSessionRef.current) {
+          emittedThisSessionRef.current = true;
+          const emitText = primary || String(alts.find(Boolean) || '').trim();
+          try { onResult?.(emitText); } catch {}
+          try { voiceBus.emitResult(emitText); } catch {}
+        }
+      }
+    } catch {}
+    try {
+      // Early iSpy detection
+      const hasISpy = alts.some((v) => String(v).toLowerCase().replace(/[^a-z]/g, '').includes('ispy'));
+      if (hasISpy && !emittedThisSessionRef.current) {
+        emittedThisSessionRef.current = true;
+        const emitText = primary || String(alts.find(Boolean) || '').trim();
+        try { onResult?.(emitText); } catch {}
+        try { voiceBus.emitResult(emitText); } catch {}
+      }
+    } catch {}
   };
 
   useEffect(() => {
@@ -222,6 +285,81 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
 
     loadVoice();
   }, []);
+
+
+  useEffect(() => {
+    const unsub = voiceBus.onRequestListen(async () => {
+      try {
+        hasPlayedBeepRef.current = false;
+        voiceSessionActiveRef.current = false;
+        lastResultRef.current = '';
+        emittedThisSessionRef.current = false;
+        if (porcupineRef.current) {
+          await porcupineRef.current.stop();
+        }
+        try {
+          await Voice?.cancel?.();
+          await Voice?.stop?.();
+          await Voice?.destroy?.();
+          await Voice?.removeAllListeners?.();
+        } catch {}
+        await new Promise<void>((r) => setTimeout(r, 1200));
+        if (Voice && typeof Voice.start === 'function') {
+          Voice.onSpeechStart = () => {
+            if (voiceSessionActiveRef.current) return;
+            voiceSessionActiveRef.current = true;
+            setIsListening(true);
+            onListeningChange?.(true);
+            voiceBus.emitListening(true);
+            if (sessionTimeoutRef.current) clearTimeout(sessionTimeoutRef.current);
+            sessionTimeoutRef.current = setTimeout(() => requestCleanup(), 15000);
+          };
+          Voice.onSpeechEnd = () => {
+            sawSpeechEndRef.current = true;
+            // Fallback: some devices may not fire final results. Ensure cleanup shortly after end.
+            setTimeout(() => { if (!cleanupRequestedRef.current) requestCleanup(); }, 2500);
+          };
+          Voice.onSpeechResults = (e: any) => {
+            if (cleanupRequestedRef.current || isCleaningUpRef.current || !voiceSessionActiveRef.current) return;
+            const values: string[] = Array.isArray(e.value) ? e.value : [];
+            const text = String(values[0] ?? '').trim();
+            if (text && !emittedThisSessionRef.current) {
+              emittedThisSessionRef.current = true;
+              lastResultRef.current = text;
+              setResult(text);
+              try { onResult?.(text); } catch {}
+              try { voiceBus.emitResult(text); } catch {}
+            }
+            requestCleanup();
+          };
+          Voice.onSpeechPartialResults = handlePartialResults;
+          Voice.onSpeechError = (e: any) => {
+            const code = e?.error?.code;
+            const message = e?.error?.message || '';
+            if (code === '5' || message.includes('Client side error')) {
+              console.log('Ignoring benign client-side error (code 5) after session.');
+              return;
+            }
+            requestCleanup();
+          };
+          // Play beep before starting recognition to avoid contaminating mic input
+          if (enableBeep && !hasPlayedBeepRef.current) { hasPlayedBeepRef.current = true; playBeep(); }
+          await new Promise<void>((r) => setTimeout(r, 200));
+          await Voice.start(language, {
+            EXTRA_PARTIAL_RESULTS: true,
+            REQUEST_PERMISSIONS_AUTO: true,
+            EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS: 8000,
+            EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS: 6000,
+            EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS: 12000,
+            EXTRA_MAX_RESULTS: 10,
+          });
+        }
+      } catch (e) {
+        console.warn('Programmatic listen failed:', e);
+      }
+    });
+    return () => unsub();
+  }, [Voice, language, enableBeep]);
 
   // Only initialize Porcupine after Voice is loaded
   useEffect(() => {
@@ -297,40 +435,8 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
 
                 // Partials (early detection)
                 Voice.onSpeechPartialResults = (e: any) => {
-                  if (cleanupRequestedRef.current || isCleaningUpRef.current || !voiceSessionActiveRef.current) return;
-                  const alts: string[] = Array.isArray(e.value) ? e.value : [];
-                  console.log('Partial speech result:', alts);
-                  try {
-                    if (alts.length > 0) {
-                      const primary = String(alts[0] ?? '').trim();
-                      if (primary && primary !== lastResultRef.current) {
-                        lastResultRef.current = primary;
-                        setResult(primary);
-                      }
-                      // Early intent: robust match for "i spy" across variants
-                      const hasISpy = alts.some((v) =>
-                        String(v).toLowerCase().replace(/[^a-z]/g, '').includes('ispy')
-                      );
-                      if (hasISpy && !emittedThisSessionRef.current) {
-                        emittedThisSessionRef.current = true;
-                        const emitText = primary || String(alts.find(Boolean) || '').trim();
-                        try { onResult?.(emitText); } catch {}
-                        try { voiceBus.emitResult(emitText); } catch {}
-                      }
-                      // Heuristic: multiple alternatives likely means the recognizer is done
-                      if (alts.length > 1) {
-                        console.log('Partial result looks final, initiating cleanup.');
-                        if (lastResultRef.current && !emittedThisSessionRef.current) {
-                          emittedThisSessionRef.current = true;
-                          try { onResult?.(lastResultRef.current); } catch {}
-                          try { voiceBus.emitResult(lastResultRef.current); } catch {}
-                        }
-                        requestCleanup();
-                      }
-                    }
-                  } catch (err) {
-                    console.error('Error processing partial result:', err);
-                  }
+                  try { console.log('Partial speech result:', Array.isArray(e?.value) ? e.value : []); } catch {}
+                  handlePartialResults(e);
                 };
 
                 // Errors
@@ -364,21 +470,22 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
                     console.log('Safety timeout: Force ending voice session');
                     requestCleanup();
                   }, 15000);
-                  if (enableBeep && !hasPlayedBeepRef.current) {
-                    hasPlayedBeepRef.current = true;
-                    playBeep();
-                  }
                 };
 
                 // End
                 Voice.onSpeechEnd = () => {
                   console.log('Speech recognition ended. Waiting for final result...');
                   sawSpeechEndRef.current = true;
+                  // Fallback if no final results arrive
+                  setTimeout(() => { if (!cleanupRequestedRef.current) requestCleanup(); }, 2500);
                 };
-
-                handlersRegisteredRef.current = true;
-
-                console.log('Starting voice recognition with extended timeouts...');
+                // Start recognition with tuning options
+                // Play beep before starting recognition to avoid contaminating mic input
+                if (enableBeep && !hasPlayedBeepRef.current) {
+                  hasPlayedBeepRef.current = true;
+                  playBeep();
+                }
+                await new Promise<void>((r) => setTimeout(r, 200));
                 await Voice.start(language, {
                   EXTRA_PARTIAL_RESULTS: true,
                   REQUEST_PERMISSIONS_AUTO: true,
@@ -456,33 +563,32 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
 
  return (
     <View style={styles.container}>
-      <Text style={styles.title}>Voice Test</Text>
       {result ? (
-        <View style={styles.resultContainer}>
-          <Text style={styles.resultText}>Result: {result}</Text>
+        <View>
+          <Text style={styles.title}>"{result}"</Text>
         </View>
       ) : null}      
-      <View style={styles.statusContainer}>
-        {isListening ? (
-          <Text style={[styles.status, styles.listening]}>
-            🎤 Listening... Speak now!
-          </Text>
-        ) : (
-          <Text style={styles.status}>
-            Say "Hey Game Box" to start listening...
-          </Text>
-        )}
-      </View>
+      {!isSpeaking && (
+        <View style={styles.statusContainer}>
+          {isListening ? (
+            <Text style={[styles.status, styles.listening]}>
+              Listening... Speak now!
+            </Text>
+          ) : (
+            <Text style={styles.status}>
+              Say "Hey Game Box" to start playing...
+            </Text>
+          )}
+        </View>
+      )}
     </View>
   );
 };
 
 const styles = StyleSheet.create({
   container: {
-    flex: 1,
-    justifyContent: 'center',
     alignItems: 'center',
-    padding: 20,
+    paddingVertical: 8,
   },
   title: {
     fontSize: 24,
