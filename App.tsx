@@ -39,7 +39,7 @@ function App() {
         if (spoken) return;
         spoken = true;
         cleanupReplyWait();
-        setTimeout(() => { speakText("ok, instructions on how to play will be here soon"); }, 200);
+        setTimeout(() => { speakText("Okay, here's how to play. Whenever you want to play I spy, just say 'Hey Game Box'. Wait for the beep, and then say 'play I spy'. I will give all the players one object to find, and who ever sees it first wins! If you want a new object, just say 'hey game box' again, and then say 'play I spy'."); }, 1000);
       };
       unsub = voiceBus.onResult((text) => {
         const norm = String(text).toLowerCase().trim();

@@ -26,6 +26,8 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [Voice, setVoice] = useState<any>(null);
   const porcupineRef = useRef<PorcupineManager | null>(null);
+  const porcupineActiveRef = useRef(false);
+  const porcupinePausedByTTSRef = useRef(false);
   const isCleaningUpRef = useRef(false);
   const hasPlayedBeepRef = useRef(false);
   const voiceSessionActiveRef = useRef(false);
@@ -37,6 +39,7 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
   const handlersRegisteredRef = useRef(false);
   const cleanupRequestedRef = useRef(false);
   const ttsClearTimerRef = useRef<any>(null);
+  const ttsActiveRef = useRef(false);
 
   const requestCleanup = () => {
     if (!cleanupRequestedRef.current) {
@@ -100,11 +103,19 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
       // Longer delay before restarting Porcupine to avoid mic contention
       setTimeout(() => {
         console.log('Restarting Porcupine after safe delay (post-end)...');
+        if (ttsActiveRef.current) {
+          console.log('TTS active during cleanup; deferring Porcupine restart.');
+          porcupinePausedByTTSRef.current = true;
+          isCleaningUpRef.current = false;
+          cleanupRequestedRef.current = false;
+          return;
+        }
         if (porcupineRef.current) {
           porcupineRef.current
             .start()
             .then(() => {
               console.log('Porcupine restarted successfully.');
+              porcupineActiveRef.current = true;
               isCleaningUpRef.current = false;
               cleanupRequestedRef.current = false;
             })
@@ -130,11 +141,19 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
         try { if (Voice?.destroy) Voice.destroy().catch(() => {}); } catch {}
         setTimeout(() => {
           console.log('Teardown path: Step 3 - restart Porcupine');
+          if (ttsActiveRef.current) {
+            console.log('TTS active during cleanup; deferring Porcupine restart.');
+            porcupinePausedByTTSRef.current = true;
+            isCleaningUpRef.current = false;
+            cleanupRequestedRef.current = false;
+            return;
+          }
           if (porcupineRef.current) {
             porcupineRef.current
               .start()
               .then(() => {
                 console.log('Porcupine restarted successfully.');
+                porcupineActiveRef.current = true;
                 isCleaningUpRef.current = false;
                 cleanupRequestedRef.current = false;
               })
@@ -207,7 +226,21 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
   // Track TTS speaking state to hide status while TTS is active
   useEffect(() => {
     const onStart = () => {
+      // Mark TTS active and ensure nothing else is listening
+      ttsActiveRef.current = true;
       setIsSpeaking(true);
+      // If somehow a recognition session is active, end it to avoid recording TTS
+      if (isListening || voiceSessionActiveRef.current) {
+        try { requestCleanup(); } catch {}
+      }
+      // Pause Porcupine so wake word won't trigger from our own TTS
+      try {
+        if (porcupineRef.current && porcupineActiveRef.current) {
+          porcupineRef.current.stop().catch(() => {});
+          porcupineActiveRef.current = false;
+          porcupinePausedByTTSRef.current = true;
+        }
+      } catch {}
       // Always clear the quoted result with a small delay
       try { if (ttsClearTimerRef.current) { clearTimeout(ttsClearTimerRef.current); ttsClearTimerRef.current = null; } } catch {}
       const last = (lastResultRef.current || result || '').toString();
@@ -223,7 +256,29 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
         try { lastResultRef.current = ''; } catch {}
       }
     };
-    const onEnd = () => setIsSpeaking(false);
+    const onEnd = () => {
+      setIsSpeaking(false);
+      ttsActiveRef.current = false;
+      // Resume Porcupine only if we paused it for TTS and no voice session is active
+      try {
+        if (porcupineRef.current && porcupinePausedByTTSRef.current && !voiceSessionActiveRef.current && !isListening && !isCleaningUpRef.current) {
+          porcupineRef.current
+            .start()
+            .then(() => {
+              porcupineActiveRef.current = true;
+              porcupinePausedByTTSRef.current = false;
+            })
+            .catch(() => {
+              porcupinePausedByTTSRef.current = false;
+            });
+        }
+      } catch {}
+      try { if (ttsClearTimerRef.current) { clearTimeout(ttsClearTimerRef.current); ttsClearTimerRef.current = null; } } catch {}
+      if ((lastResultRef.current || '').trim().length > 0) {
+        setResult('');
+        try { lastResultRef.current = ''; } catch {}
+      }
+    };
     Tts.addEventListener('tts-start', onStart);
     Tts.addEventListener('tts-finish', onEnd);
     Tts.addEventListener('tts-cancel', onEnd);
@@ -296,6 +351,7 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
         emittedThisSessionRef.current = false;
         if (porcupineRef.current) {
           await porcupineRef.current.stop();
+          porcupineActiveRef.current = false;
         }
         try {
           await Voice?.cancel?.();
@@ -376,6 +432,11 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
           ['Hey-Game-Box_en_android_v3_0_0.ppn'],
           async (keywordIndex) => {
             console.log('Wake word "Hey Game Box" detected! Starting listening...');
+            // If TTS is speaking, ignore this wake trigger to avoid self-activation
+            if (ttsActiveRef.current) {
+              console.log('Ignoring wake word during TTS.');
+              return;
+            }
             onWake?.();
             voiceBus.emitWake();
             // Reset flags for new listening session
@@ -395,6 +456,7 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
                 console.log('Stopping Porcupine to free microphone...');
                 if (porcupineRef.current) {
                   await porcupineRef.current.stop();
+                  porcupineActiveRef.current = false;
                 }
                 
                 // More thorough cleanup of Voice recognition
@@ -506,6 +568,7 @@ const VoiceRecog: React.FC<VoiceRecogProps> = ({
         );
         if (porcupineRef.current) {
           await porcupineRef.current.start();
+          porcupineActiveRef.current = true;
         } else {
           Alert.alert('Porcupine error', 'PorcupineManager failed to initialize.');
         }
