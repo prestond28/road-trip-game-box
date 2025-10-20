@@ -20,7 +20,7 @@ function App() {
     // Move to the gameplay UI and then speak
     setStarted(true);
     setTimeout(async () => {
-      await speakText('Hello there! Welcome to road trip game box. Do you already know how to play?');
+      await speakText('Hello there! Welcome to road trip game box. The current game available to play is I Spy. Do you already know how to play?');
 
   voiceBus.setAwaitingAnswer(true);
       voiceBus.emitRequestListen();
